@@ -41,9 +41,12 @@ function unescapeFlight(s: string): string {
  * Next.js app-router pages embed their data in
  *   self.__next_f.push([1,"<escaped payload>"])</script>
  * scripts. Decode every payload into one searchable text blob.
+ * The closing tag match tolerates an optional semicolon / whitespace
+ * (some Next.js versions emit `);</script>`), so chunks are never
+ * silently skipped due to formatting.
  */
 function extractFlightText(html: string): string {
-  const re = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)<\/script>/g;
+  const re = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)\s*;?\s*<\/script>/g;
   let out = '';
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
@@ -209,7 +212,7 @@ function parseNovelPage(
   if (m) details.status = m[1];
 
   // Cover: first supabase-hosted cover image on the page is the novel's own.
-  m = /"src":"(https:\/\/[^\"]*?supabase[^\"]*?covers[^\"]*?)"/.exec(flight);
+  m = /"src":"(https:\/\/[^"]*?supabase[^"]*?covers[^"]*?)"/.exec(flight);
   if (m) details.cover = m[1];
 
   // Synopsis from the meta description tag.
