@@ -1,8 +1,22 @@
 import { fetchText } from '@libs/fetch';
 import { Plugin } from '@/types/plugin';
 import { NovelStatus } from '@libs/novelStatus';
+import { Filters, FilterTypes } from '@libs/filterInputs';
 
 const API = 'https://api.wetriedtls.com';
+
+/**
+ * Build the catalog browse URL for a page. The API honors the `status`
+ * query param (Ongoing / Completed / Dropped / Canceled) but ignores
+ * `tags` and `sort` params, so status is the only exposed filter.
+ * 'all' (or empty) means no status filtering.
+ */
+function catalogUrl(pageNo: number, status?: string): string {
+  let url = API + '/query?adult=true&query_string=&page=' + pageNo;
+  const s = (status || '').trim();
+  if (s && s !== 'all') url += '&status=' + encodeURIComponent(s);
+  return url;
+}
 const SITE = 'https://wetriedtls.com';
 
 type NovelCard = {
@@ -356,20 +370,52 @@ function mapStatus(s: string): string {
   return NovelStatus.Unknown;
 }
 
+// --- Catalog filters ----------------------------------------------------
+// The API honors `status` but ignores `tags` and `sort`, so the filter
+// menu offers status only.
+const STATUS_FILTER_OPTIONS = [
+  { label: 'All', value: 'all' },
+  { label: 'Ongoing', value: 'Ongoing' },
+  { label: 'Completed', value: 'Completed' },
+  { label: 'Dropped', value: 'Dropped' },
+  { label: 'Canceled', value: 'Canceled' },
+] as const;
+
+/**
+ * Pull a plain string value out of the app's filter payload, which may be
+ * the raw string or a { type, value } wrapper object.
+ */
+function extractFilterValue(filters: unknown, key: string): string {
+  if (!filters || typeof filters !== 'object') return '';
+  const f = (filters as Record<string, unknown>)[key];
+  if (f === null || f === undefined) return '';
+  const v =
+    typeof f === 'object' && 'value' in f ? (f as { value: unknown }).value : f;
+  return typeof v === 'string' ? v : '';
+}
+
 class WeTriedTLS implements Plugin.PluginBase {
   id = 'wetriedtls';
   name = 'We Tried TLS';
   icon = 'src/en/wetriedtls/icon.png';
   site = SITE;
-  version = '1.0.3';
+  version = '1.0.4';
+
+  filters = {
+    status: {
+      type: FilterTypes.Picker,
+      label: 'Status',
+      value: 'all',
+      options: STATUS_FILTER_OPTIONS,
+    },
+  } satisfies Filters;
 
   async popularNovels(
     pageNo: number,
-    _options: Plugin.PopularNovelsOptions,
+    { filters }: Plugin.PopularNovelsOptions<typeof this.filters>,
   ): Promise<Plugin.NovelItem[]> {
-    const page = parseQueryResults(
-      await fetchText(API + '/query?adult=true&query_string=&page=' + pageNo),
-    );
+    const status = extractFilterValue(filters, 'status');
+    const page = parseQueryResults(await fetchText(catalogUrl(pageNo, status)));
     if (pageNo > page.lastPage) return [];
     return page.items.map(n => ({
       name: n.title,
