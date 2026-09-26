@@ -233,6 +233,25 @@ function chapterDisplayName(c: ChapterInfo): string {
   return c.locked ? '🔒 ' + c.name : c.name;
 }
 
+function proxiedImageUrl(url: string, width: number): string {
+  const bare = url.replace(/^https?:\/\//i, '');
+  return (
+    'https://images.weserv.nl/?url=' +
+    encodeURIComponent(bare) +
+    '&w=' +
+    width +
+    '&q=80&output=webp'
+  );
+}
+
+function shrinkIllustrations(html: string): string {
+  return html.replace(
+    /<img\b([^>]*?)\bsrc="(https?:\/\/media\.reaperscans\.net\/[^"]+)"([^>]*?)>/gi,
+    (_m, pre, src, post) =>
+      '<img' + pre + ' src="' + proxiedImageUrl(src, 800) + '"' + post + '>',
+  );
+}
+
 /**
  * Route a cover through a fast image proxy at a list-friendly size.
  * The site's own covers are up to ~1 MB (they load painfully slowly in
@@ -242,12 +261,7 @@ function chapterDisplayName(c: ChapterInfo): string {
 function coverUrl(thumbnail: string): string {
   const t = (thumbnail || '').trim();
   if (!/^https?:\/\//i.test(t)) return t;
-  const bare = t.replace(/^https?:\/\//i, '');
-  return (
-    'https://images.weserv.nl/?url=' +
-    encodeURIComponent(bare) +
-    '&w=400&q=80&output=webp'
-  );
+  return proxiedImageUrl(t, 400);
 }
 
 type ChapterContentResult =
@@ -331,7 +345,7 @@ function parseChapterContent(html: string): ChapterContentResult {
   while (end > start && isEdgeJunk(blocks[end - 1])) end--;
   const cleaned = blocks.slice(start, end).join('\n');
   if (!paragraphText(cleaned)) return { status: 'empty' };
-  return { status: 'ok', html: cleaned };
+  return { status: 'ok', html: shrinkIllustrations(cleaned) };
 }
 
 function mapStatus(s: string): string {
@@ -347,7 +361,7 @@ class WeTriedTLS implements Plugin.PluginBase {
   name = 'We Tried TLS';
   icon = 'src/en/wetriedtls/icon.png';
   site = SITE;
-  version = '1.0.1';
+  version = '1.0.3';
 
   async popularNovels(
     pageNo: number,
