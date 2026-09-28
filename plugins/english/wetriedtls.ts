@@ -133,14 +133,34 @@ function paragraphText(p: string): string {
   return decodeEntities(p.replace(/<[^>]+>/g, '')).trim();
 }
 
-function isTitleRepeat(p: string): boolean {
-  // A paragraph that is nothing but bold text, e.g. the repeated
-  // series / chapter title the site prepends to every chapter body.
+function isTitleRepeat(p: string, knownTitles?: string[]): boolean {
+  // A paragraph that is nothing but bold text is the site's repeated
+  // series / chapter title header — but only when it actually matches a
+  // title the caller knows. A genuine bold-only content line (a scene
+  // label, a POV header) must never be stripped, so without a matching
+  // known title nothing is treated as a repeat.
   const inner = p
     .replace(/^<p[^>]*>/i, '')
     .replace(/<\/p>$/i, '')
     .trim();
-  return /^<strong>[\s\S]*<\/strong>$/.test(inner);
+  if (!/^<strong>[\s\S]*<\/strong>$/.test(inner)) return false;
+  if (!knownTitles || knownTitles.length === 0) return false;
+  const text = decodeEntities(inner.replace(/<[^>]+>/g, ''))
+    .trim()
+    .toLowerCase();
+  return knownTitles.some(t => t.trim().toLowerCase() === text);
+}
+
+/**
+ * Translation credits ("Translator: X", "Editor: Y") are site chrome, not
+ * story content — the site puts them in the chapter header next to the
+ * banner. Stripped with the rest of the header so the reader starts at
+ * the story. Narrow on purpose: a genuine bold content line never looks
+ * like this.
+ */
+function isCreditLine(p: string): boolean {
+  const t = paragraphText(p);
+  return /^(translator|editor|proofreader|typesetter)\s*:/i.test(t);
 }
 
 function isPromoParagraph(p: string): boolean {
@@ -153,6 +173,76 @@ function isPromoParagraph(p: string): boolean {
   if (t.indexOf('dsc.gg') !== -1 || t.indexOf('join our discord') !== -1)
     return true;
   return false;
+}
+
+/**
+ * Decode the HTML entities that can appear inside an attribute value —
+ * decimal (&#106;), hex (&#x6A;), and the named entities used to smuggle a
+ * scheme past a naive prefix check (&colon;) — so the scheme test below
+ * sees what the browser will actually navigate to.
+ */
+function decodeAttrEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-f]+);?/gi, (_m, h: string) =>
+      String.fromCharCode(parseInt(h, 16)),
+    )
+    .replace(/&#(\d+);?/g, (_m, n: string) =>
+      String.fromCharCode(parseInt(n, 10)),
+    )
+    .replace(/&colon;?/gi, ':')
+    .replace(/&semi;?/gi, ';')
+    .replace(/&amp;?/gi, '&')
+    .replace(/&lt;?/gi, '<')
+    .replace(/&gt;?/gi, '>')
+    .replace(/&quot;?/gi, '"')
+    .replace(/&#0?39;?/g, "'");
+}
+
+/**
+ * True for URLs that would execute script when followed from the reader.
+ * The value is entity-decoded and stripped of whitespace/control
+ * characters first, so &#106;avascript:, javascript&colon;, and
+ * java<TAB>script:-style smuggling are all caught.
+ */
+function isScriptUrl(url: string): boolean {
+  const norm = decodeAttrEntities(url).replace(
+    /[\s\u0000-\u001f\u007f]+/g,
+    '',
+  );
+  return /^(javascript|vbscript):/i.test(norm);
+}
+
+/**
+ * Strip anything that could execute code from chapter HTML before it
+ * reaches the reader, which renders the HTML unsanitized: dangerous
+ * elements (script/iframe/object/...), event handler attributes
+ * (e.g. <img onerror=...>), and javascript: URLs. Everything else —
+ * paragraphs, headings, figures, images, inline formatting — is
+ * preserved as-is.
+ */
+function sanitizeHtml(html: string): string {
+  let out = html;
+  // Remove dangerous elements entirely, content included.
+  out = out.replace(
+    /<(script|iframe|object|embed|form|input|textarea|select|button|style|link|meta|base|noscript)[\s>][\s\S]*?<\/\1\s*>/gi,
+    '',
+  );
+  out = out.replace(
+    /<\/?(script|iframe|object|embed|form|input|textarea|select|button|style|link|meta|base|noscript)[^>]*>/gi,
+    '',
+  );
+  // Strip event handler attributes (onclick, onerror, ...).
+  out = out.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+)/gi, '');
+  // Neutralize script URLs (href/src/action). The value is entity-decoded
+  // before the scheme check so encoded variants can't slip through.
+  out = out.replace(
+    /\s(href|src|action)\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+)/gi,
+    (_m, _attr, val: string) => {
+      const unquoted = val.replace(/^['"]|['"]$/g, '');
+      return isScriptUrl(unquoted) ? '' : _m;
+    },
+  );
+  return out;
 }
 
 /** Parse the /query API response (catalog + search share the shape). */
@@ -210,29 +300,40 @@ function parseChapterList(
   jsonText: string,
   locked = false,
 ): { items: ChapterInfo[]; lastPage: number } {
+  // A blank response means the request itself failed — it must never be
+  // treated as a valid (empty) page, or callers would mistake a failed
+  // fetch for the end of the list and return an incomplete chapter list
+  // as though it were complete. Throw so the failure is loud, not silent.
+  if (!jsonText || !jsonText.trim()) {
+    throw new Error('Empty response while fetching the chapter list');
+  }
   const root = safeJson(jsonText);
+  // A non-blank but unusable response (an error page, a proxy block page,
+  // truncated JSON) must fail loudly too: silently returning an empty page
+  // here would make parseNovel stop fetching and present an incomplete
+  // chapter list as though it were complete.
+  if (!isRecord(root) || !Array.isArray(root.data)) {
+    throw new Error('Invalid chapter-list response (not the expected JSON)');
+  }
   const items: ChapterInfo[] = [];
   let lastPage = 1;
-  if (isRecord(root)) {
-    const meta = root.meta;
-    if (isRecord(meta) && typeof meta.last_page === 'number')
-      lastPage = meta.last_page;
-    const data = Array.isArray(root.data) ? root.data : [];
-    for (const c of data) {
-      if (!isRecord(c)) continue;
-      const slug = str(c.chapter_slug).trim();
-      const name = str(c.chapter_name).trim();
-      if (!slug || !name) continue;
-      const title = str(c.chapter_title).trim();
-      const idx = parseFloat(str(c.index));
-      items.push({
-        slug,
-        name: title ? name + ': ' + decodeEntities(title) : name,
-        number: isNaN(idx) ? 0 : idx,
-        publishedAt: str(c.created_at),
-        locked,
-      });
-    }
+  const meta = root.meta;
+  if (isRecord(meta) && typeof meta.last_page === 'number')
+    lastPage = meta.last_page;
+  for (const c of root.data) {
+    if (!isRecord(c)) continue;
+    const slug = str(c.chapter_slug).trim();
+    const name = str(c.chapter_name).trim();
+    if (!slug || !name) continue;
+    const title = str(c.chapter_title).trim();
+    const idx = parseFloat(str(c.index));
+    items.push({
+      slug,
+      name: title ? name + ': ' + decodeEntities(title) : name,
+      number: isNaN(idx) ? 0 : idx,
+      publishedAt: str(c.created_at),
+      locked,
+    });
   }
   return { items, lastPage };
 }
@@ -260,22 +361,24 @@ function proxiedImageUrl(url: string, width: number): string {
 
 function shrinkIllustrations(html: string): string {
   return html.replace(
-    /<img\b([^>]*?)\bsrc="(https?:\/\/media\.reaperscans\.net\/[^"]+)"([^>]*?)>/gi,
+    /<img\b([^>]*?)\bsrc="(https?:\/\/media\.reaperscans\.net\/[^\"]+)"([^>]*?)>/gi,
     (_m, pre, src, post) =>
       '<img' + pre + ' src="' + proxiedImageUrl(src, 800) + '"' + post + '>',
   );
 }
 
 /**
- * Route a cover through a fast image proxy at a list-friendly size.
- * The site's own covers are up to ~1 MB (they load painfully slowly in
- * the app's novel list) and the CDN offers no smaller variant, so we
- * request a 400px-wide webp instead. Non-URL values pass through.
+ * Covers are served directly from the site's CDN. An earlier version
+ * routed them through the images.weserv.nl proxy for smaller list
+ * thumbnails, but a single URL field cannot carry a fallback: if the
+ * proxy is blocked or down, every cover breaks while the site's own CDN
+ * still works. The direct URL avoids that external dependency.
+ * Non-URL values pass through.
  */
 function coverUrl(thumbnail: string): string {
   const t = (thumbnail || '').trim();
   if (!/^https?:\/\//i.test(t)) return t;
-  return proxiedImageUrl(t, 400);
+  return t;
 }
 
 type ChapterContentResult =
@@ -290,10 +393,17 @@ type ChapterContentResult =
  * row `<rowId>:T<hex>,` that follows, where <hex> is the exact UTF-8 byte
  * length of the payload. Slicing by that byte count is required — a
  * "next row" lookahead overshoots into flight metadata and corrupts the
- * HTML. Returns the cleaned HTML, or a non-ok status for locked /
- * missing / unparseable chapters.
+ * HTML.
+ *
+ * `knownTitles` (the novel title and this chapter's display name) lets the
+ * parser tell the site's repeated title header apart from a genuine
+ * bold-only content line, which must be kept. Returns the cleaned HTML,
+ * or a non-ok status for locked / missing / unparseable chapters.
  */
-function parseChapterContent(html: string): ChapterContentResult {
+function parseChapterContent(
+  html: string,
+  knownTitles?: string[],
+): ChapterContentResult {
   if (/this chapter is premium!/i.test(html)) return { status: 'premium' };
   // Only the real <title> element counts for the 404 check: Next.js flight
   // data always embeds a notFound template containing similar wording.
@@ -346,20 +456,41 @@ function parseChapterContent(html: string): ChapterContentResult {
     .trim();
   if (!body) return { status: 'empty' };
 
-  // Split into top-level blocks — paragraphs, headings, figures and
-  // standalone images, in document order — and trim the site's promo
-  // header / footer (banner, series/chapter title repeats, discord plug).
-  const blocks = body.match(
-    /<p[\s\S]*?<\/p>|<h[1-6][\s\S]*?<\/h[1-6]>|<figure[\s\S]*?<\/figure>|<img[^>]*>/gi,
-  ) || [body];
+  // Split into top-level blocks in document order. Paragraphs, headings,
+  // figures and standalone images are recognized; anything else that
+  // carries text (lists, tables, blockquotes, divs) is kept too — dropping
+  // it would silently lose chapter content. Only the site's promo header /
+  // footer (banner, credits, title repeats, discord plug) is trimmed from
+  // the edges.
+  const blocks: string[] = [];
+  const blockRe =
+    /<p[\s\S]*?<\/p>|<h[1-6][\s\S]*?<\/h[1-6]>|<figure[\s\S]*?<\/figure>|<img[^>]*>/gi;
+  let last = 0;
+  let bm: RegExpExecArray | null;
+  while ((bm = blockRe.exec(body)) !== null) {
+    const gap = body.slice(last, bm.index);
+    if (gap.replace(/<[^>]+>/g, '').trim()) blocks.push(gap.trim());
+    blocks.push(bm[0]);
+    last = bm.index + bm[0].length;
+  }
+  const tail = body.slice(last);
+  if (tail.replace(/<[^>]+>/g, '').trim()) blocks.push(tail.trim());
+  if (blocks.length === 0) blocks.push(body);
+
   let start = 0;
   let end = blocks.length;
-  const isEdgeJunk = (p: string) => isPromoParagraph(p) || isTitleRepeat(p);
+  const isEdgeJunk = (p: string) =>
+    isPromoParagraph(p) || isCreditLine(p) || isTitleRepeat(p, knownTitles);
   while (start < end && isEdgeJunk(blocks[start])) start++;
   while (end > start && isEdgeJunk(blocks[end - 1])) end--;
   const cleaned = blocks.slice(start, end).join('\n');
-  if (!paragraphText(cleaned)) return { status: 'empty' };
-  return { status: 'ok', html: shrinkIllustrations(cleaned) };
+  // An image-only chapter (illustrations with no text) is still real
+  // content — it must not be reported as empty.
+  if (!paragraphText(cleaned) && !/<img[\s>]/i.test(cleaned))
+    return { status: 'empty' };
+  // The reader renders this HTML unsanitized, so strip anything that
+  // could run code (event handlers, scripts, javascript: URLs) first.
+  return { status: 'ok', html: sanitizeHtml(shrinkIllustrations(cleaned)) };
 }
 
 function mapStatus(s: string): string {
@@ -399,7 +530,13 @@ class WeTriedTLS implements Plugin.PluginBase {
   name = 'We Tried TLS';
   icon = 'src/en/wetriedtls/icon.png';
   site = SITE;
-  version = '1.0.4';
+  version = '1.0.6';
+
+  // Novel/chapter titles behind each chapter path, recorded by parseNovel.
+  // parseChapter passes them to parseChapterContent so the site's repeated
+  // title header can be told apart from a genuine bold-only content line
+  // (which must be kept).
+  private chapterTitles: Record<string, string[]> = {};
 
   filters = {
     status: {
@@ -439,16 +576,21 @@ class WeTriedTLS implements Plugin.PluginBase {
     let pageNo = 1;
     let lastPage = 1;
     do {
-      const page = parseChapterList(
-        await fetchText(
-          API +
-            '/chapters/' +
-            detail.id +
-            '?page=' +
-            pageNo +
-            '&perPage=500&order=asc',
-        ),
+      const json = await fetchText(
+        API +
+          '/chapters/' +
+          detail.id +
+          '?page=' +
+          pageNo +
+          '&perPage=500&order=asc',
       );
+      // The official fetchText returns '' when the request fails. That must
+      // never be treated as a valid page: parseChapterList would default
+      // lastPage to 1 and parseNovel would return an incomplete chapter
+      // list as though it were complete. Fail loudly instead.
+      if (!json || !json.trim())
+        throw new Error('Failed to load the chapter list (page ' + pageNo + ')');
+      const page = parseChapterList(json);
       lastPage = page.lastPage;
       for (const c of page.items) all.push(c);
       pageNo++;
@@ -489,12 +631,18 @@ class WeTriedTLS implements Plugin.PluginBase {
       })
       .sort((a, b) => a.number - b.number)
       .forEach(c => {
+        const displayName = chapterDisplayName(c);
+        const chapterPath = slug + '/' + c.slug;
         chapters.push({
-          name: chapterDisplayName(c),
-          path: slug + '/' + c.slug,
+          name: displayName,
+          path: chapterPath,
           releaseTime: c.publishedAt,
           chapterNumber: c.number,
         });
+        this.chapterTitles[chapterPath] = [
+          detail.name,
+          displayName.replace(/^🔒\s*/, ''),
+        ];
       });
 
     const novel: Plugin.SourceNovel = {
@@ -513,6 +661,7 @@ class WeTriedTLS implements Plugin.PluginBase {
   async parseChapter(chapterPath: string): Promise<string> {
     const result = parseChapterContent(
       await fetchText(SITE + '/series/' + chapterPath),
+      this.chapterTitles[chapterPath],
     );
     if (result.status === 'ok') return result.html;
     if (result.status === 'premium') {
