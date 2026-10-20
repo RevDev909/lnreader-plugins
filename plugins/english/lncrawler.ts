@@ -426,7 +426,8 @@ class LNCrawler implements Plugin.PluginBase {
     return pageNo > page.totalPages ? [] : page.cards;
   }
 
-  resolveUrl = (path: string) => `${this.site}/novels/${path}`;
+  resolveUrl = (path: string) =>
+    /^https?:\/\//i.test(path) ? path : `${this.site}/novels/${path}`;
 }
 
 export default new LNCrawler();
