@@ -364,7 +364,8 @@ class Atsumaru implements Plugin.PluginBase {
     return parseNovelCards(data);
   }
 
-  resolveUrl = (path: string) => `${this.site}/title/${path}`;
+  resolveUrl = (path: string) =>
+    /^https?:\/\//i.test(path) ? path : `${this.site}/title/${path}`;
 }
 
 export default new Atsumaru();
