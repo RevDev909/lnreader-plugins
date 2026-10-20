@@ -229,7 +229,19 @@ function parseChapterList(text: string): ChapterEntry[] {
   }
   const raw: unknown[] = Array.isArray(data)
     ? data
-    : (data as { chapters?: unknown[] }).chapters || [];
+    : (() => {
+        if (data === null || typeof data !== 'object') {
+          throw new Error('Chapter list response had an unexpected shape');
+        }
+        const chapters = (data as { chapters?: unknown }).chapters;
+        if (!Array.isArray(chapters)) {
+          // An error payload or a changed shape must surface as a
+          // clear error — never as a novel that silently shows zero
+          // chapters. A genuine empty array stays valid.
+          throw new Error('Chapter list response had an unexpected shape');
+        }
+        return chapters;
+      })();
   const entries: ChapterEntry[] = [];
   for (const item of raw) {
     const it = item as {
@@ -256,25 +268,40 @@ function parseChapterList(text: string): ChapterEntry[] {
 }
 
 /**
- * Chapter body: the inner HTML of <div class="ln-prose">. The div is
- * located by class, then matched to its closing tag by depth scan so
- * nested markup can never truncate the content.
+ * Chapter body: the inner HTML of <div class="ln-prose">. Scripts,
+ * styles and comments are removed before locating the div, so a
+ * `.ln-prose` CSS rule, a JS reference to the class, or a comment
+ * earlier in the page can never mislocate the content; the div is
+ * then matched to its closing tag by depth scan so nested markup
+ * can never truncate the content.
  */
 function parseChapterContent(html: string): string {
   checkSize(html);
-  const marker = html.indexOf('ln-prose');
-  if (marker < 0) return '';
-  const tagStart = html.lastIndexOf('<div', marker);
-  if (tagStart < 0) return '';
-  const tagEnd = html.indexOf('>', marker);
+  const clean = html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '');
+  // Find the real opening tag whose class list contains ln-prose —
+  // never a bare indexOf('ln-prose'), which can land inside a style
+  // rule, a script, or a comment and grab the wrong div (or none).
+  const openRe = /<div\b[^>]*>/g;
+  let m: RegExpExecArray | null;
+  let tagEnd = -1;
+  while ((m = openRe.exec(clean)) !== null) {
+    const cls = /\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(m[0]);
+    const tokens = (cls && (cls[1] !== undefined ? cls[1] : cls[2])) || '';
+    if (/(^|\s)ln-prose(\s|$)/.test(tokens)) {
+      tagEnd = m.index + m[0].length;
+      break;
+    }
+  }
   if (tagEnd < 0) return '';
   let depth = 1;
-  const contentStart = tagEnd + 1;
+  const contentStart = tagEnd;
   const divRe = /<\/?div\b[^>]*>/g;
   divRe.lastIndex = contentStart;
-  let m: RegExpExecArray | null;
   let contentEnd = -1;
-  while ((m = divRe.exec(html)) !== null) {
+  while ((m = divRe.exec(clean)) !== null) {
     if (m[0].startsWith('</')) {
       depth--;
       if (depth === 0) {
@@ -286,12 +313,7 @@ function parseChapterContent(html: string): string {
     }
   }
   if (contentEnd < 0) return '';
-  return html
-    .slice(contentStart, contentEnd)
-    .replace(/<script\b[\s\S]*?<\/script>/gi, '')
-    .replace(/<style\b[\s\S]*?<\/style>/gi, '')
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .trim();
+  return clean.slice(contentStart, contentEnd).trim();
 }
 
 class LightNovelTo implements Plugin.PluginBase {
