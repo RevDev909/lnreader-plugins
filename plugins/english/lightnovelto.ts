@@ -399,7 +399,9 @@ class LightNovelTo implements Plugin.PluginBase {
   }
 
   resolveUrl(path: string): string {
-    return this.site + path;
+    // Absolute URLs (e.g. the cover image, which EPUB export passes
+    // through here) must go out unchanged.
+    return /^https?:\/\//i.test(path) ? path : this.site + path;
   }
 }
 
