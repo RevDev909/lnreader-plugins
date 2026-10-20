@@ -115,6 +115,17 @@ class CoteReader implements Plugin.PluginBase {
     }
   }
 
+  /**
+   * Error with the HTTP status attached. Tooling (e.g. the repo's live
+   * check) reads `error.status` to tell a site block or outage (403/503)
+   * apart from a plugin bug, so always throw fetch failures this way.
+   */
+  private httpError(message: string, status: number): Error {
+    const err = new Error(message) as Error & { status?: number };
+    err.status = status;
+    return err;
+  }
+
   async popularNovels(
     pageNo: number,
     { filters }: Plugin.PopularNovelsOptions<typeof this.filters>,
@@ -126,7 +137,10 @@ class CoteReader implements Plugin.PluginBase {
 
     const res = await fetchApi(url);
     if (!res.ok) {
-      throw new Error(`Failed to load popular novels: HTTP ${res.status}`);
+      throw this.httpError(
+        `Failed to load popular novels: HTTP ${res.status}`,
+        res.status,
+      );
     }
 
     const data = await this.safeJson<{ items?: CoteNovelMeta[] }>(res);
@@ -163,7 +177,10 @@ class CoteReader implements Plugin.PluginBase {
     const url = `${this.site}/api/novels?q=${encodeURIComponent(searchTerm)}&page=${pageNo}&limit=20`;
     const res = await fetchApi(url);
     if (!res.ok) {
-      throw new Error(`Failed to search novels: HTTP ${res.status}`);
+      throw this.httpError(
+        `Failed to search novels: HTTP ${res.status}`,
+        res.status,
+      );
     }
 
     const data = await this.safeJson<{ items?: CoteNovelMeta[] }>(res);
@@ -200,7 +217,10 @@ class CoteReader implements Plugin.PluginBase {
     const res = await fetchApi(metaUrl);
 
     if (!res.ok) {
-      throw new Error(`Failed to load novel metadata: HTTP ${res.status}`);
+      throw this.httpError(
+        `Failed to load novel metadata: HTTP ${res.status}`,
+        res.status,
+      );
     }
 
     const data = await this.safeJson<CoteNovelMeta>(res);
@@ -295,7 +315,10 @@ class CoteReader implements Plugin.PluginBase {
       const chUrl = `${this.site}/assets/${id}/chapters/${chapterId}.json`;
       const res = await fetchApi(chUrl);
       if (!res.ok) {
-        throw new Error(`Failed to fetch chapter: HTTP ${res.status}`);
+        throw this.httpError(
+          `Failed to fetch chapter: HTTP ${res.status}`,
+          res.status,
+        );
       }
 
       const chData = await this.safeJson<{
@@ -313,11 +336,15 @@ class CoteReader implements Plugin.PluginBase {
       const res = await fetchApi(cacheUrl);
       if (!res.ok) {
         if (res.status === 404) {
-          throw new Error(
+          throw this.httpError(
             'This volume is not yet available on COTE Reader (HTTP 404).',
+            404,
           );
         }
-        throw new Error(`Failed to fetch volume: HTTP ${res.status}`);
+        throw this.httpError(
+          `Failed to fetch volume: HTTP ${res.status}`,
+          res.status,
+        );
       }
 
       const json =
@@ -350,13 +377,20 @@ class CoteReader implements Plugin.PluginBase {
         try {
           const res = await fetchApi(volUrl);
           if (res.status === 503) {
+            lastErr = this.httpError(
+              'Remote server is busy (HTTP 503: Cloudflare Worker limit). Please retry in a moment.',
+              503,
+            );
             await new Promise(resolve =>
               setTimeout(resolve, 1000 * (attempt + 1)),
             );
             continue;
           }
           if (!res.ok) {
-            throw new Error(`Failed to fetch volume: HTTP ${res.status}`);
+            throw this.httpError(
+              `Failed to fetch volume: HTTP ${res.status}`,
+              res.status,
+            );
           }
           volData = await this.safeJson<VolumeApiResponse>(res);
           break;
@@ -372,9 +406,7 @@ class CoteReader implements Plugin.PluginBase {
 
       if (!volData) {
         if (lastErr?.message?.includes('503')) {
-          throw new Error(
-            'Remote server is busy (HTTP 503: Cloudflare Worker limit). Please retry in a moment.',
-          );
+          throw lastErr;
         }
         throw (
           lastErr ||
