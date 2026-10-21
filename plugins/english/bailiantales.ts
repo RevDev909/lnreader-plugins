@@ -18,7 +18,7 @@ class BaiLianTales implements Plugin.PluginBase {
   name = 'BaiLianTales';
   icon = 'src/en/bailiantales/icon.png';
   site = 'https://bailiantales.com/';
-  version = '2.2.5';
+  version = '2.2.6';
 
   private baseUrl = 'https://bailiantales.com';
 
@@ -36,8 +36,10 @@ class BaiLianTales implements Plugin.PluginBase {
     const res = await fetchApi(url);
     if (!res.ok) {
       // Past the last listing page the site answers 404; that is the
-      // end of the list, not an error.
-      if (pageNo > 1) return '';
+      // end of the list, not an error. Any other failure must surface
+      // so the reader sees an error to retry instead of a list that
+      // silently stops short.
+      if (pageNo > 1 && res.status === 404) return '';
       const err: HttpError = new Error(`Could not reach site (${res.status})`);
       err.status = res.status;
       throw err;
@@ -376,7 +378,11 @@ class BaiLianTales implements Plugin.PluginBase {
         if (removeTags.has(tagName)) {
           $el.remove();
         } else {
-          $el.replaceWith($el.html() || '');
+          // Unwrap by moving the existing child nodes, never by
+          // re-parsing their HTML: re-parsed nodes are fresh objects the
+          // cleanup loop below never visits, so their event handlers
+          // would survive into the returned chapter text.
+          $el.replaceWith($el.contents());
         }
         continue;
       }
@@ -386,13 +392,27 @@ class BaiLianTales implements Plugin.PluginBase {
       for (const name of Object.keys(attribs)) {
         const value = attribs[name];
         if (name === 'href' || name === 'src') {
-          if (/^\s*(javascript|vbscript|data:text\/html)/i.test(value)) {
+          // Strip tabs and newlines first: the URL parser removes them,
+          // so a scheme broken up by one ('java\tscript:') would pass the
+          // check below and come back out as a live script link.
+          const cleaned = value.replace(/[\t\n\r]/g, '');
+          if (/^\s*(javascript|vbscript|data:text\/html)/i.test(cleaned)) {
             $el.removeAttr(name);
-          } else if (/^(https?:)?\/\//i.test(value)) {
-            $el.attr(name, value.startsWith('//') ? 'https:' + value : value);
+          } else if (/^(https?:)?\/\//i.test(cleaned)) {
+            $el.attr(
+              name,
+              cleaned.startsWith('//') ? 'https:' + cleaned : cleaned,
+            );
           } else {
             try {
-              $el.attr(name, new URL(value, this.site).href);
+              const parsed = new URL(cleaned, this.site);
+              // The parsed protocol is the backstop: anything that
+              // normalizes into a non-http(s) scheme is dropped.
+              if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                $el.attr(name, parsed.href);
+              } else {
+                $el.removeAttr(name);
+              }
             } catch {
               $el.removeAttr(name);
             }
