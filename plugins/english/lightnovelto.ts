@@ -292,8 +292,21 @@ function parseChapterList(text: string): ChapterEntry[] {
  * characters and lowercasing, so mixed-case and control-character
  * smuggling fail too.
  */
+/**
+ * Strip executable content from chapter HTML before it reaches the
+ * reader. Attribute cleaning runs TAG BY TAG (not over the whole
+ * string), so story text is never touched: `<p>Set online=true</p>`
+ * keeps its words, while a real `on*` attribute inside a tag dies.
+ * Attribute separators are whitespace OR slash, so
+ * `<img src="x"/onerror=...>` is caught too. URL values are checked
+ * regardless of quoting (double, single, or unquoted) and AFTER
+ * decoding HTML entities, so `javascript&colon;...`, `&#106;...`,
+ * semicolon-less numerics, and mixed-case / control-character
+ * smuggling are all caught; story markup (paragraphs, images, links,
+ * tables) is kept.
+ */
 function sanitizeChapterHtml(html: string): string {
-  return html
+  const noExecutable = html
     .replace(
       /<(script|style|noscript|iframe|object|embed|form)\b[\s\S]*?<\/\1\s*>/gi,
       '',
@@ -301,61 +314,85 @@ function sanitizeChapterHtml(html: string): string {
     .replace(
       /<(script|style|noscript|iframe|object|embed|form|link|meta|base)\b[^>]*>/gi,
       '',
-    )
-    .replace(/\son\w+\s*=\s*"[^"]*"/gi, '')
-    .replace(/\son\w+\s*=\s*'[^']*'/gi, '')
-    .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')
-    .replace(/\sstyle\s*=\s*"[^"]*"/gi, '')
-    .replace(/\sstyle\s*=\s*'[^']*'/gi, '')
-    .replace(
-      /\s(?:href|src)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi,
-      function (m: string) {
-        return isSafeUrlValue(m) ? m : '';
-      },
     );
+  return noExecutable.replace(/<[^>]*>/g, function (tag: string) {
+    return tag
+      .replace(/[\s/](on\w+)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+      .replace(/[\s/]style\s*=\s*(?:"[^"]*"|'[^']*')/gi, '')
+      .replace(
+        /[\s/](?:href|src)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi,
+        function (m: string) {
+          return isSafeUrlValue(m) ? m : '';
+        },
+      );
+  });
 }
 
 // Decode HTML character references the way a browser decodes an
-// attribute value: numeric (decimal and hex) plus the common named
-// references, repeated so double-encoding can't smuggle a scheme past
-// the check. Decoding only ever makes the check stricter, never looser.
+// attribute value, then test the scheme. Numeric references (decimal
+// and hex, either x case, with or without the semicolon) plus the
+// scheme-relevant named references (`&colon;`, `&Tab;`, `&NewLine;`,
+// `&sol;`) and the legacy semicolon-less named references; repeated so
+// double-encoding can't smuggle a scheme past the check. Decoding only
+// ever makes the check stricter, never looser.
 function decodeEntities(value: string): string {
   let out = value;
   for (let i = 0; i < 3; i++) {
     const next = out
-      .replace(/&#(\d+);/g, function (_m: string, code: string) {
+      .replace(/&#(\d+);?/g, function (_m: string, code: string) {
         const n = parseInt(code, 10);
         return !isNaN(n) && n >= 0 && n <= 0x10ffff
           ? String.fromCharCode(n)
           : _m;
       })
-      .replace(/&#x([0-9a-fA-F]+);/g, function (_m: string, code: string) {
+      .replace(/&#[xX]([0-9a-fA-F]+);?/g, function (_m: string, code: string) {
         const n = parseInt(code, 16);
         return !isNaN(n) && n >= 0 && n <= 0x10ffff
           ? String.fromCharCode(n)
           : _m;
       })
+      .replace(/&colon;/g, ':')
+      .replace(/&Tab;/g, '\t')
+      .replace(/&NewLine;/g, '\n')
+      .replace(/&sol;/g, '/')
       .replace(/&amp;/g, '&')
       .replace(/&lt;/g, '<')
       .replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"')
-      .replace(/&apos;/g, "'");
+      .replace(/&apos;/g, "'")
+      .replace(/&amp(?![a-zA-Z0-9=])/g, '&')
+      .replace(/&lt(?![a-zA-Z0-9=])/g, '<')
+      .replace(/&gt(?![a-zA-Z0-9=])/g, '>')
+      .replace(/&quot(?![a-zA-Z0-9=])/g, '"');
     if (next === out) break;
     out = next;
   }
   return out;
 }
 
-function isSafeUrlValue(attr: string): boolean {
-  let raw = '';
-  const quoted = /"([^"]*)"|'([^']*)'/.exec(attr);
-  if (quoted) {
-    raw = quoted[1] !== undefined ? quoted[1] : quoted[2];
-  } else {
-    const unquoted = /=\s*([^\s>]+)/.exec(attr);
-    if (unquoted) raw = unquoted[1];
+// Read the attribute value from immediately after `=`: a quoted value
+// is everything up to its matching quote, an unquoted value runs to the
+// next whitespace or `>`. Never search for quotes anywhere in the
+// match — for `href=javascript:alert('x')` the value is the whole
+// `javascript:alert('x')`, not `'x'`.
+function attrValue(attr: string): string {
+  const eq = attr.indexOf('=');
+  if (eq < 0) return '';
+  const rest = attr.slice(eq + 1).replace(/^\s+/, '');
+  if (rest.charAt(0) === '"') {
+    const end = rest.indexOf('"', 1);
+    return end < 0 ? rest.slice(1) : rest.slice(1, end);
   }
-  const clean = decodeEntities(raw)
+  if (rest.charAt(0) === "'") {
+    const end = rest.indexOf("'", 1);
+    return end < 0 ? rest.slice(1) : rest.slice(1, end);
+  }
+  const m = /^[^\s>]+/.exec(rest);
+  return m ? m[0] : '';
+}
+
+function isSafeUrlValue(attr: string): boolean {
+  const clean = decodeEntities(attrValue(attr))
     .split('')
     .filter(function (ch: string) {
       const code = ch.charCodeAt(0);
