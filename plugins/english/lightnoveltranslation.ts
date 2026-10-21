@@ -110,12 +110,7 @@ class LNTPlugin implements Plugin.PluginBase {
       .first()
       .text()
       .trim();
-
-    const body2 = await fetchApi(url.replace('?tab=table_contents', ''));
-    const html2 = await body2.text().then(r => r.replace(/>\s+</g, '><'));
-    const loadedCheerio2 = loadCheerio(html2);
-
-    novel.summary = loadedCheerio2('div.novel_text')
+    novel.summary = loadedCheerio('div.novel_text')
       .find('p')
       .first()
       .text()
