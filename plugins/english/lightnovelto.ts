@@ -275,6 +275,99 @@ function parseChapterList(text: string): ChapterEntry[] {
  * then matched to its closing tag by depth scan so nested markup
  * can never truncate the content.
  */
+/**
+ * Strip executable content from chapter HTML. Chapter bodies are
+ * untrusted markup: scripts, frames, form elements, inline event
+ * handlers and javascript:/vbscript: URLs must not reach the reader.
+ * URL schemes are tested after stripping control characters and
+ * lowercasing, so java<TAB>script: and mixed-case smuggling can't pass.
+ */
+/**
+ * Strip executable content from chapter HTML before it reaches the
+ * reader: scripts, frames, form elements, inline event handlers and
+ * javascript:/vbscript:/data:text/html URLs. URL values are checked
+ * regardless of quoting (double, single, or unquoted) and AFTER
+ * decoding HTML entities, so 'javascript:...' and '&#106;avascript:...'
+ * are caught equally; schemes are then tested after stripping control
+ * characters and lowercasing, so mixed-case and control-character
+ * smuggling fail too.
+ */
+function sanitizeChapterHtml(html: string): string {
+  return html
+    .replace(
+      /<(script|style|noscript|iframe|object|embed|form)\b[\s\S]*?<\/\1\s*>/gi,
+      '',
+    )
+    .replace(
+      /<(script|style|noscript|iframe|object|embed|form|link|meta|base)\b[^>]*>/gi,
+      '',
+    )
+    .replace(/\son\w+\s*=\s*"[^"]*"/gi, '')
+    .replace(/\son\w+\s*=\s*'[^']*'/gi, '')
+    .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')
+    .replace(/\sstyle\s*=\s*"[^"]*"/gi, '')
+    .replace(/\sstyle\s*=\s*'[^']*'/gi, '')
+    .replace(
+      /\s(?:href|src)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi,
+      function (m: string) {
+        return isSafeUrlValue(m) ? m : '';
+      },
+    );
+}
+
+// Decode HTML character references the way a browser decodes an
+// attribute value: numeric (decimal and hex) plus the common named
+// references, repeated so double-encoding can't smuggle a scheme past
+// the check. Decoding only ever makes the check stricter, never looser.
+function decodeEntities(value: string): string {
+  let out = value;
+  for (let i = 0; i < 3; i++) {
+    const next = out
+      .replace(/&#(\d+);/g, function (_m: string, code: string) {
+        const n = parseInt(code, 10);
+        return !isNaN(n) && n >= 0 && n <= 0x10ffff
+          ? String.fromCharCode(n)
+          : _m;
+      })
+      .replace(/&#x([0-9a-fA-F]+);/g, function (_m: string, code: string) {
+        const n = parseInt(code, 16);
+        return !isNaN(n) && n >= 0 && n <= 0x10ffff
+          ? String.fromCharCode(n)
+          : _m;
+      })
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'");
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
+function isSafeUrlValue(attr: string): boolean {
+  let raw = '';
+  const quoted = /"([^"]*)"|'([^']*)'/.exec(attr);
+  if (quoted) {
+    raw = quoted[1] !== undefined ? quoted[1] : quoted[2];
+  } else {
+    const unquoted = /=\s*([^\s>]+)/.exec(attr);
+    if (unquoted) raw = unquoted[1];
+  }
+  const clean = decodeEntities(raw)
+    .split('')
+    .filter(function (ch: string) {
+      const code = ch.charCodeAt(0);
+      return code > 32 && code !== 127;
+    })
+    .join('')
+    .toLowerCase();
+  if (/^(javascript|vbscript)\s*:/.test(clean)) return false;
+  if (/^data\s*:\s*text\/html/.test(clean)) return false;
+  return true;
+}
+
 function parseChapterContent(html: string): string {
   checkSize(html);
   const clean = html
@@ -313,7 +406,7 @@ function parseChapterContent(html: string): string {
     }
   }
   if (contentEnd < 0) return '';
-  return clean.slice(contentStart, contentEnd).trim();
+  return sanitizeChapterHtml(clean.slice(contentStart, contentEnd).trim());
 }
 
 class LightNovelTo implements Plugin.PluginBase {
@@ -321,7 +414,7 @@ class LightNovelTo implements Plugin.PluginBase {
   name = 'LightNovel.to';
   icon = 'src/en/lightnovelto/icon.png';
   site = 'https://lightnovel.to';
-  version = '1.0.0';
+  version = '1.0.1';
 
   async popularNovels(
     pageNo: number,
@@ -400,8 +493,11 @@ class LightNovelTo implements Plugin.PluginBase {
 
   resolveUrl(path: string): string {
     // Absolute URLs (e.g. the cover image, which EPUB export passes
-    // through here) must go out unchanged.
-    return /^https?:\/\//i.test(path) ? path : this.site + path;
+    // through here) must go out unchanged; protocol-relative URLs
+    // upgrade to https.
+    if (/^https?:\/\//i.test(path)) return path;
+    if (path.indexOf('//') === 0) return 'https:' + path;
+    return this.site + path;
   }
 }
 
