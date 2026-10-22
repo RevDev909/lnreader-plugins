@@ -15,12 +15,53 @@ class LNTPlugin implements Plugin.PluginBase {
   name = 'Light Novel Translations';
   icon = 'src/en/lightnoveltranslations/icon.png';
   site = 'https://lightnovelstranslations.com/';
-  version = '1.0.1';
+  version = '1.0.2';
   filters: Filters | undefined = undefined;
   imageRequestInit?: Plugin.ImageRequestInit | undefined = undefined;
 
   //flag indicates whether access to LocalStorage, SesesionStorage is required.
   webStorageUtilized?: boolean;
+
+  // The site serves only 6 novels per page, so one app page fetches
+  // several consecutive site pages and combines them. Otherwise opening
+  // the source shows a nearly empty grid next to sources that serve 20+
+  // novels per page.
+  pagesPerAppPage = 5;
+
+  // Site pages covered by one app page: app page 1 -> site pages 1-5,
+  // app page 2 -> site pages 6-10, and so on.
+  appPageSitePages(appPage: number): number[] {
+    const first = (appPage - 1) * this.pagesPerAppPage + 1;
+    const pages: number[] = [];
+    for (let i = 0; i < this.pagesPerAppPage; i++) {
+      pages.push(first + i);
+    }
+    return pages;
+  }
+
+  async fetchNovelCards(urls: string[]): Promise<Plugin.NovelItem[]> {
+    const novels: Plugin.NovelItem[] = [];
+    for (const url of urls) {
+      const body = await fetchApi(url);
+      const html = await body.text();
+      const cards = this.parseNovelCards(html);
+      novels.push(...cards);
+    }
+    return novels;
+  }
+
+  browsePageUrl(pageNo: number, sortby: string): string {
+    return pageNo > 1
+      ? `${this.site}browse/page/${pageNo}/?sortby=${sortby}`
+      : `${this.site}browse/?sortby=${sortby}`;
+  }
+
+  searchPageUrl(pageNo: number, searchTerm: string): string {
+    const query = `field-search=${encodeURIComponent(searchTerm)}`;
+    return pageNo > 1
+      ? `${this.site}browse/page/${pageNo}/?${query}`
+      : `${this.site}browse/?${query}`;
+  }
 
   async popularNovels(
     pageNo: number,
@@ -30,15 +71,10 @@ class LNTPlugin implements Plugin.PluginBase {
     }: Plugin.PopularNovelsOptions<typeof this.filters>,
   ): Promise<Plugin.NovelItem[]> {
     const sortby = showLatestNovels ? 'most-recent' : 'most-liked';
-    const link =
-      pageNo > 1
-        ? `${this.site}browse/page/${pageNo}/?sortby=${sortby}`
-        : `${this.site}browse/?sortby=${sortby}`;
-
-    const body = await fetchApi(link);
-    const html = await body.text();
-
-    return this.parseNovelCards(html);
+    const urls = this.appPageSitePages(pageNo).map(page =>
+      this.browsePageUrl(page, sortby),
+    );
+    return this.fetchNovelCards(urls);
   }
 
   parseNovelCards(html: string): Plugin.NovelItem[] {
@@ -149,15 +185,13 @@ class LNTPlugin implements Plugin.PluginBase {
     searchTerm: string,
     pageNo: number,
   ): Promise<Plugin.NovelItem[]> {
-    // get novels using the search term
-
-    if (pageNo !== 1) return [];
-    const searchUrl = `${this.site}browse/?search=${encodeURIComponent(searchTerm)}`;
-
-    const results = await fetchApi(searchUrl);
-    const body = await results.text();
-
-    return this.parseNovelCards(body);
+    // The site's search box submits `field-search`, not `search`. Sending
+    // `search` is silently ignored and returns the default browse list for
+    // every term, so results looked identical no matter what was searched.
+    const urls = this.appPageSitePages(pageNo).map(page =>
+      this.searchPageUrl(page, searchTerm),
+    );
+    return this.fetchNovelCards(urls);
   }
 
   resolveUrl = (path: string) => this.site + path;
